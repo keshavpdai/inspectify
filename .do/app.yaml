@@ -1,0 +1,26 @@
+name: inspectify
+services:
+- name: api
+  environment_slug: python
+  github:
+    branch: main
+    deploy_on_push: true
+  run_command: uvicorn app.main:app --host 0.0.0.0 --port 8080
+  http_port: 8080
+  instance_count: 1
+  instance_size_slug: professional-xs
+  envs:
+  - key: MODEL_PATH
+    value: models/yolo11m_trained.pt
+  - key: ENV
+    value: production
+  - key: SAVE_ANNOTATED_IMAGES
+    value: "true"
+  - key: IMAGE_RETENTION_HOURS
+    value: "24"
+  - key: OUTPUT_DIR
+    value: /tmp/outputs/inspections
+  - key: MAX_STORAGE_GB
+    value: "10"
+  health_check:
+    http_path: /health
