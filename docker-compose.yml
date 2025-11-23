@@ -12,6 +12,15 @@ services:
       IMAGE_RETENTION_HOURS: "24"
       OUTPUT_DIR: /app/outputs/inspections
       MAX_STORAGE_GB: "10"
+      # Post-processing filter settings
+      ENABLE_SHATTERED_GLASS_FILTER: "true"
+      SHATTERED_GLASS_CONF_THRESHOLD: "0.85"
+      # Car detection settings (two-stage detection)
+      CAR_DETECTOR_MODEL: "/app/models/yolov8n.pt"
+      CAR_DETECTION_CONF: "0.4"
+      CAR_DETECTION_PADDING: "20"
+      DETECT_ONLY_CARS: "true"
+      ENABLE_TWO_STAGE_DETECTION: "true"
     ports:
       - "8000:8000"
     volumes:

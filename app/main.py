@@ -12,9 +12,22 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 
 from app.cache import inspection_cache
-from app.config import SAVE_ANNOTATED_IMAGES, CLASS_CONF_THRESHOLDS, MODEL_PATH, MODEL_URL
+from app.config import (
+    SAVE_ANNOTATED_IMAGES, 
+    CLASS_CONF_THRESHOLDS, 
+    MODEL_PATH, 
+    MODEL_URL,
+    ENABLE_SHATTERED_GLASS_FILTER,
+    CAR_DETECTOR_MODEL,
+    CAR_DETECTION_CONF,
+    CAR_DETECTION_PADDING,
+    DETECT_ONLY_CARS,
+    ENABLE_TWO_STAGE_DETECTION
+)
 import requests
 from app.detection import YOLO11mDetector
+from app.car_detector import CarDetector
+from app.damage_filters import filter_detections
 from app.image_processor import ImageProcessor
 from app.image_storage import image_storage
 from app.models import (
@@ -46,17 +59,26 @@ app.add_middleware(
 
 # Global services
 detector = None
+car_detector = None
 image_processor = None
 retinex_enhancer = None
 
 
 @app.on_event("startup")
 async def startup_event():
-    global detector, image_processor, retinex_enhancer
+    global detector, car_detector, image_processor, retinex_enhancer
 
     logger.info("Initializing services...")
 
     try:
+        # Initialize car detector FIRST (fast, ~6MB model auto-downloads)
+        if ENABLE_TWO_STAGE_DETECTION:
+            car_detector = CarDetector(model_path=CAR_DETECTOR_MODEL)
+            logger.info("✅ Two-stage detection enabled")
+        else:
+            logger.info("⚠️ Two-stage detection disabled")
+        
+        # Then damage detector
         model_path = str(MODEL_PATH)
         if MODEL_URL and not os.path.exists(model_path):
             r = requests.get(MODEL_URL, stream=True, timeout=60)
@@ -119,21 +141,109 @@ async def detect_damage_from_url(request: DetectionRequest):
         # Resize if needed
         image = image_processor.resize_if_needed(image)
 
-        # Apply enhancement if needed
+        # TWO-STAGE DETECTION FLOW
+        all_detections = []
         image_enhanced = False
-        if request.enable_enhancement:
-            image, image_enhanced = retinex_enhancer.enhance_if_needed(image)
-
-        # Run inference
-        detections, annotated_image = detector.predict(
-            image,
-            conf=request.confidence_threshold,
-            iou=request.iou_threshold,
-            imgsz=request.img_size,
-            augment=request.enable_tta,
-            agnostic_nms=request.agnostic_nms,
-            class_thresholds=CLASS_CONF_THRESHOLDS,
-        )
+        
+        if ENABLE_TWO_STAGE_DETECTION and car_detector is not None:
+            # STAGE 1: Detect vehicles in full image
+            logger.info("🚗 Stage 1: Detecting vehicles...")
+            vehicles = car_detector.detect_vehicles(
+                image, 
+                conf=CAR_DETECTION_CONF,
+                include_classes=['car'] if DETECT_ONLY_CARS else ['car', 'truck', 'bus']
+            )
+            
+            if not vehicles:
+                logger.warning(f"⚠️ No vehicle detected in image for {request.vehicle_id}")
+                
+                # Return empty result
+                response = DetectionResponse(
+                    status="success",
+                    inspection_id=inspection_id,
+                    vehicle_id=request.vehicle_id,
+                    timestamp=datetime.utcnow().isoformat(),
+                    image_url=str(request.image_url),
+                    damage_metrics=DamageMetrics(
+                        total_detections=0,
+                        dents=0, scratches=0, cracks=0,
+                        broken_lamps=0, shattered_glass=0, flat_tires=0,
+                        severity="none",
+                        total_damage_pixels=0
+                    ),
+                    detections=[],
+                    processing_time_ms=(time.time() - start_time) * 1000,
+                    image_enhanced=False,
+                    message="No vehicle detected in image"
+                )
+                
+                inspection_cache.save(inspection_id, response.dict())
+                return response
+            
+            # STAGE 2: Run damage detection on each vehicle region
+            logger.info(f"🔍 Stage 2: Analyzing {len(vehicles)} vehicle region(s)...")
+            for vehicle_region, (x_offset, y_offset, x_max, y_max) in car_detector.crop_vehicle_regions(
+                image, vehicles, padding=CAR_DETECTION_PADDING
+            ):
+                # Apply enhancement if needed (on cropped region)
+                if request.enable_enhancement:
+                    vehicle_region, image_enhanced = retinex_enhancer.enhance_if_needed(vehicle_region)
+                
+                # Run damage detection on cropped vehicle region
+                region_detections, _ = detector.predict_with_offset(
+                    vehicle_region,
+                    bbox_offset=(x_offset, y_offset),
+                    conf=request.confidence_threshold,
+                    iou=request.iou_threshold,
+                    imgsz=request.img_size,
+                    augment=request.enable_tta,
+                    agnostic_nms=request.agnostic_nms,
+                    class_thresholds=CLASS_CONF_THRESHOLDS,
+                )
+                
+                # STAGE 3: Apply post-processing filters
+                region_detections = filter_detections(
+                    region_detections,
+                    vehicle_region,  # Use cropped region for analysis
+                    enable_shattered_glass_filter=ENABLE_SHATTERED_GLASS_FILTER
+                )
+                
+                # Accumulate detections
+                all_detections.extend(region_detections)
+            
+            detections = all_detections
+            logger.info(f"✅ Two-stage detection complete: {len(detections)} damage(s) found")
+        
+        else:
+            # FALLBACK: Single-stage detection (original behavior)
+            logger.info("🔍 Single-stage detection (two-stage disabled)...")
+            
+            # Apply enhancement if needed
+            if request.enable_enhancement:
+                image, image_enhanced = retinex_enhancer.enhance_if_needed(image)
+            
+            # Run inference on full image
+            detections, _ = detector.predict(
+                image,
+                conf=request.confidence_threshold,
+                iou=request.iou_threshold,
+                imgsz=request.img_size,
+                augment=request.enable_tta,
+                agnostic_nms=request.agnostic_nms,
+                class_thresholds=CLASS_CONF_THRESHOLDS,
+            )
+            
+            # Apply post-processing filters
+            detections = filter_detections(
+                detections,
+                image,
+                enable_shattered_glass_filter=ENABLE_SHATTERED_GLASS_FILTER
+            )
+        
+        # Regenerate annotated image with filtered detections
+        # This ensures the image matches the API response
+        annotated_image = detector.create_annotated_image(image, detections)
+        
         metrics = detector.calculate_metrics(detections)
 
         # Format response
@@ -233,21 +343,109 @@ async def detect_damage_from_upload(
         # Resize if needed
         image = image_processor.resize_if_needed(image)
 
-        # Apply enhancement if needed
+        # TWO-STAGE DETECTION FLOW
+        all_detections = []
         image_enhanced = False
-        if enable_enhancement:
-            image, image_enhanced = retinex_enhancer.enhance_if_needed(image)
-
-        # Run inference
-        detections, annotated_image = detector.predict(
-            image,
-            conf=confidence_threshold,
-            iou=0.5,
-            imgsz=1280,
-            augment=False,
-            agnostic_nms=False,
-            class_thresholds=CLASS_CONF_THRESHOLDS,
-        )
+        
+        if ENABLE_TWO_STAGE_DETECTION and car_detector is not None:
+            # STAGE 1: Detect vehicles in full image
+            logger.info("🚗 Stage 1: Detecting vehicles...")
+            vehicles = car_detector.detect_vehicles(
+                image, 
+                conf=CAR_DETECTION_CONF,
+                include_classes=['car'] if DETECT_ONLY_CARS else ['car', 'truck', 'bus']
+            )
+            
+            if not vehicles:
+                logger.warning(f"⚠️ No vehicle detected in image for {vehicle_id}")
+                
+                # Return empty result
+                response = DetectionResponse(
+                    status="success",
+                    inspection_id=inspection_id,
+                    vehicle_id=vehicle_id,
+                    timestamp=datetime.utcnow().isoformat(),
+                    image_url=f"local:{file.filename}",
+                    damage_metrics=DamageMetrics(
+                        total_detections=0,
+                        dents=0, scratches=0, cracks=0,
+                        broken_lamps=0, shattered_glass=0, flat_tires=0,
+                        severity="none",
+                        total_damage_pixels=0
+                    ),
+                    detections=[],
+                    processing_time_ms=(time.time() - start_time) * 1000,
+                    image_enhanced=False,
+                    message="No vehicle detected in image"
+                )
+                
+                inspection_cache.save(inspection_id, response.dict())
+                return response
+            
+            # STAGE 2: Run damage detection on each vehicle region
+            logger.info(f"🔍 Stage 2: Analyzing {len(vehicles)} vehicle region(s)...")
+            for vehicle_region, (x_offset, y_offset, x_max, y_max) in car_detector.crop_vehicle_regions(
+                image, vehicles, padding=CAR_DETECTION_PADDING
+            ):
+                # Apply enhancement if needed (on cropped region)
+                if enable_enhancement:
+                    vehicle_region, image_enhanced = retinex_enhancer.enhance_if_needed(vehicle_region)
+                
+                # Run damage detection on cropped vehicle region
+                region_detections, _ = detector.predict_with_offset(
+                    vehicle_region,
+                    bbox_offset=(x_offset, y_offset),
+                    conf=confidence_threshold,
+                    iou=0.5,
+                    imgsz=1280,
+                    augment=False,
+                    agnostic_nms=False,
+                    class_thresholds=CLASS_CONF_THRESHOLDS,
+                )
+                
+                # STAGE 3: Apply post-processing filters
+                region_detections = filter_detections(
+                    region_detections,
+                    vehicle_region,  # Use cropped region for analysis
+                    enable_shattered_glass_filter=ENABLE_SHATTERED_GLASS_FILTER
+                )
+                
+                # Accumulate detections
+                all_detections.extend(region_detections)
+            
+            detections = all_detections
+            logger.info(f"✅ Two-stage detection complete: {len(detections)} damage(s) found")
+        
+        else:
+            # FALLBACK: Single-stage detection (original behavior)
+            logger.info("🔍 Single-stage detection (two-stage disabled)...")
+            
+            # Apply enhancement if needed
+            if enable_enhancement:
+                image, image_enhanced = retinex_enhancer.enhance_if_needed(image)
+            
+            # Run inference on full image
+            detections, _ = detector.predict(
+                image,
+                conf=confidence_threshold,
+                iou=0.5,
+                imgsz=1280,
+                augment=False,
+                agnostic_nms=False,
+                class_thresholds=CLASS_CONF_THRESHOLDS,
+            )
+            
+            # Apply post-processing filters
+            detections = filter_detections(
+                detections,
+                image,
+                enable_shattered_glass_filter=ENABLE_SHATTERED_GLASS_FILTER
+            )
+        
+        # Regenerate annotated image with filtered detections
+        # This ensures the image matches the API response
+        annotated_image = detector.create_annotated_image(image, detections)
+        
         metrics = detector.calculate_metrics(detections)
 
         # Format response
